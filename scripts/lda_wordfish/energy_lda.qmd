@@ -1,0 +1,184 @@
+---
+title: "TAD LDA for Env/Energy Comments"
+author: "PRDough"
+format: html
+editor: visual
+execute:
+  warning: false
+  message: false
+embed-resources: true
+editor_options: 
+  chunk_output_type: console
+---
+
+### 0. Load packages & set path
+
+```{r}
+pacman::p_load(
+  tidyverse,
+  quanteda,
+  quanteda.textstats,
+  quanteda.textmodels,
+  topicmodels,
+  tidytext,
+  slam,
+  janitor
+)
+
+# setwd("") # <<< SET YOUR PROJECT DATA DIRECTORY HERE
+
+data <- readr::read_csv("", show_col_types = FALSE) # <<< LOAD DBSCAN-PROCESSED COMMENT
+
+```
+
+### 1. Build corpus & DFM
+
+```{r}
+# Corpus: doc IDs = commentId, text = text_clean
+corp <- corpus(
+  data,
+  docid_field = "commentId",
+  text_field  = "text_clean"
+)
+
+# Tokenize and build DFM (remove punctuation/numbers/symbols; remove stopwords; trim rare terms)
+dfm_data <- corp %>%
+  tokens(
+    remove_punct   = TRUE,
+    remove_numbers = TRUE,
+    remove_symbols = TRUE
+  ) %>%
+  dfm() %>%
+  dfm_remove(stopwords("en")) %>%
+  dfm_trim(min_docfreq = 2, verbose = FALSE)
+
+# Inspect DFM dimensions (documents × terms)
+dfm_data
+
+```
+
+### 2. Convert to DTM and drop empty documents
+
+```{r}
+# Convert quanteda DFM to a topicmodels-compatible DTM
+dtm <- quanteda::convert(dfm_data, to = "topicmodels")
+
+# Identify non-empty documents (at least 1 token)
+doc_totals <- slam::row_sums(dtm)
+nonempty_docs <- doc_totals > 0
+
+# Quick check: kept vs dropped
+sum(nonempty_docs)     # kept
+sum(!nonempty_docs)    # dropped (all-zero)
+
+# Filter DTM / DFM / data to keep row alignment
+dtm_clean  <- dtm[nonempty_docs, ]
+dfm_clean  <- dfm_data[nonempty_docs, ]
+data_clean <- data[nonempty_docs, ]
+
+# Store cleaned text in docvars for later reference
+docvars(dfm_clean, "text_clean") <- data_clean$text_clean
+
+# Set initial number of topics
+K <- 30
+
+```
+
+### 3. Fit LDA model (K = 30)
+
+```{r}
+set.seed(7253)
+
+lda <- LDA(
+  dtm_clean,
+  k = K,
+  method = "Gibbs",
+  control = list(
+    verbose = 25L,  # print progress every N iterations
+    seed    = 123,
+    burnin  = 100,
+    iter    = 500
+  )
+)
+
+```
+
+### 4. Summarize topics (terms, beta, gamma)
+
+```{r}
+# 4.1 Top-N terms per topic (quick view)
+terms <- get_terms(lda, 10)
+
+terms_df <- as_tibble(terms) %>%
+  janitor::clean_names() %>%
+  pivot_longer(
+    cols      = contains("topic"),
+    names_to  = "topic",
+    values_to = "words"
+  ) %>%
+  group_by(topic) %>%
+  summarise(
+    words = paste(words, collapse = ", "),
+    .groups = "drop"
+  )
+
+# 4.2 Extract beta (topic-term probabilities) and plot top terms per topic
+beta_lda <- tidy(lda, matrix = "beta")
+
+beta_lda_top_terms <- beta_lda %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup() %>%
+  arrange(topic, desc(beta))
+
+beta_lda_top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered() +
+  labs(
+    title = "Top terms by topic (K = 30)",
+    x     = "beta (P(term | topic))",
+    y     = NULL
+  )
+
+# 4.3 Extract gamma (document-topic probabilities) and pick one representative document per topic
+gamma_lda <- tidy(lda, matrix = "gamma")
+
+main_doc_topic <- gamma_lda %>%
+  group_by(topic) %>%
+  slice_max(gamma, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+```
+
+### 5. Re-attach metadata & build a representative documents table
+
+```{r}
+# Pull document-level metadata from dfm_clean
+df_docvars <- as_tibble(docvars(dfm_clean)) %>%
+  mutate(document = docid(dfm_clean))
+
+# Join representative docs (highest gamma per topic) and attach top terms
+df_topics <- df_docvars %>%
+  right_join(main_doc_topic, by = "document") %>%
+  mutate(topic = paste0("topic_", topic)) %>%
+  left_join(terms_df, by = "topic")
+
+df_topics %>%
+  select(topic, document, gamma, words, text_clean) %>%
+  arrange(topic, desc(gamma)) %>%
+  head()
+
+```
+
+### 6. Export topics table
+
+```{r}
+topic_words <- df_topics %>%
+  distinct(topic, words) %>%
+  arrange(topic)
+
+write_csv(df_topics, "df_topics_k30.csv")
+```
