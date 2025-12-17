@@ -52,3 +52,9 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# macOS
+.DS_Store
+
+# Quarto/HTML assets generated alongside README render
+README_files/

@@ -1,0 +1,329 @@
+---
+title: "Wordfish: Bootlegger-Baptist Detection"
+author: "PRDough"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: true
+    code-summary: "Show/Hide R code"
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r setup}
+# Optional: global figure settings for Quarto/knitr output
+knitr::opts_chunk$set(fig.width = 8, fig.height = 4.5, dpi = 300)
+
+library(tidyverse)
+library(stringr)
+library(tidytext)
+library(quanteda)
+library(quanteda.textmodels)
+library(wesanderson)
+library(pROC)
+
+theme_set(theme_minimal())
+```
+
+### 0. Load data & define coalition labels
+
+```{r}
+# === Load data ===
+data_path1 <- "<<< FILL IN CSV PATH FOR DOCKET A >>>"
+data_path2 <- "<<< FILL IN CSV PATH FOR DOCKET B >>>"
+
+fish_data_raw1 <- read_csv(data_path1, show_col_types = FALSE)
+fish_data_raw2 <- read_csv(data_path2, show_col_types = FALSE)
+
+# Option A (combine both):
+fish_data <- bind_rows(fish_data_raw1, fish_data_raw2)
+# Option B (use only one):
+# fish_data <- fish_data_raw1
+# fish_data <- fish_data_raw2
+
+# Keep rows with non-empty organization names
+fish_data <- fish_data %>%
+  filter(.data$organizationName != "<empty>")
+
+# === Define organization name column ===
+ORG_COL <- "organizationName"
+
+fish_data <- fish_data %>%
+  mutate(org_name = as.character(.data[[ORG_COL]]))
+
+fish_data %>%
+  distinct(org_name) %>%
+  slice(1:20)
+
+```
+
+```{r}
+# === Classify organizations into roles (docket-based) ===
+
+fish_data <- fish_data %>%
+  mutate(
+    org_name_std = str_to_lower(str_squish(coalesce(org_name, ""))),
+
+    econ_role = case_when(
+      org_name_std == "" ~ "unknown",
+
+      # Baptist-like: advocacy / public-interest / climate & jobs language
+      str_detect(org_name_std, regex("\\b(climate|environment|clean energy|justice|sustainab)\\w*\\b")) &
+        str_detect(org_name_std, regex("\\b(alliance|coalition|roundtable|network|council|foundation|nonprofit|ngo|advocat)\\w*\\b")) ~
+        "baptist_like",
+
+      # Bootlegger-like: companies / industry associations / business groups
+      str_detect(org_name_std, regex("\\b(inc|llc|ltd|corp|corporation|company|co\\.|group|holdings|partners|services)\\b")) |
+        str_detect(org_name_std, regex("\\b(association|institute|chamber|business council|roundtable)\\b")) ~
+        "bootlegger_like",
+
+      # Labor/unions (optional handling; see below)
+      str_detect(org_name_std, regex("\\b(union|brotherhood|building trades|labor|laborers|workers)\\b")) ~
+        "union_like",
+
+      TRUE ~ "other"
+    ),
+
+    # ---- Option A: STRICT binary (only baptist / bootlegger; everything else = NA)
+    coalition_bin = case_when(
+      econ_role == "baptist_like"    ~ "baptist",
+      econ_role == "bootlegger_like" ~ "bootlegger",
+      TRUE                           ~ NA_character_
+    )
+
+    # ---- Option B: Binary with unions forced to one side (pick ONE)
+    # coalition_bin = case_when(
+    #   econ_role == "baptist_like"    ~ "baptist",
+    #   econ_role == "bootlegger_like" ~ "bootlegger",
+    #   econ_role == "union_like"      ~ "baptist",      # or "bootlegger"
+    #   TRUE                           ~ "other"
+    # )
+  )
+
+fish_data %>% count(coalition_bin, sort = TRUE)
+
+```
+
+### 1. Build corpus, tokens, dfm
+
+```{r}
+corpus_fish <- corpus(
+  fish_data,
+  text_field      = "text_clean",
+  unique_docnames = TRUE
+)
+
+toks_fish <- tokens(corpus_fish, remove_punct = TRUE) %>%
+  tokens_remove(stopwords("en"), padding = FALSE) %>%
+  tokens_keep(min_nchar = 2) %>%
+  tokens_wordstem(language = "en")
+
+dfm_fish <- dfm(toks_fish)
+
+dfm_fish
+
+```
+
+### 2. Initial wordfish (unanchored)
+
+```{r}
+wfish0 <- textmodel_wordfish(dfm_fish)
+
+theta0_df <- tibble(
+  docname = docnames(dfm_fish),
+  theta0  = wfish0$theta
+) %>%
+  bind_cols(as_tibble(docvars(corpus_fish)))
+
+theta0_df %>%
+  arrange(desc(theta0)) %>%
+  slice(1:5) %>%
+  select(docname, theta0, org_name, coalition_true, econ_role)
+
+theta0_df %>%
+  arrange(theta0) %>%
+  slice(1:5) %>%
+  select(docname, theta0, org_name, coalition_true, econ_role)
+
+# Check word β extremes to help interpret dimensions
+wordweights_vec <- wfish0$beta
+names(wordweights_vec) <- featnames(dfm_fish)
+
+top_positive_words <- sort(wordweights_vec, decreasing = TRUE) %>% head(30)
+top_negative_words <- sort(wordweights_vec, decreasing = FALSE) %>% head(30)
+
+top_positive_words
+top_negative_words
+
+```
+
+### 3. Choose anchors using "true" coalition labels
+
+```{r}
+# Keep only Baptists/Bootleggers for anchor selection
+theta_anchor <- theta0_df %>%
+  filter(coalition_true %in% c("baptist", "bootlegger"))
+
+table(theta_anchor$coalition_true)
+
+# Anchor documents: most extreme theta within each coalition
+anchor_bap_doc <- theta_anchor %>%
+  filter(coalition_true == "baptist") %>%
+  slice_min(theta0, n = 1) %>%
+  pull(docname)
+
+anchor_boot_doc <- theta_anchor %>%
+  filter(coalition_true == "bootlegger") %>%
+  slice_max(theta0, n = 1) %>%
+  pull(docname)
+
+# Get their row indices in the DFM
+anchor_bap_idx  <- which(docnames(dfm_fish) == anchor_bap_doc)
+anchor_boot_idx <- which(docnames(dfm_fish) == anchor_boot_doc)
+
+anchor_bap_doc
+anchor_boot_doc
+anchor_bap_idx
+anchor_boot_idx
+
+```
+
+### 4. Re-estimate wordfish with Baptist–Bootlegger direction
+
+```{r}
+# Re-estimate Wordfish with directed anchors (Baptist -> Bootlegger)
+wfish_bb <- textmodel_wordfish(
+  dfm_fish,
+  dir = c(anchor_bap_idx, anchor_boot_idx)
+)
+
+# Merge directed theta back with document metadata
+theta_bb_df <- tibble(
+  docname = docnames(dfm_fish),
+  theta   = wfish_bb$theta
+) %>%
+  bind_cols(as_tibble(docvars(corpus_fish)))
+
+# Compare theta distributions for Baptists vs Bootleggers
+theta_bb_df %>%
+  filter(coalition_true %in% c("baptist", "bootlegger")) %>%
+  group_by(coalition_true) %>%
+  summarise(
+    n          = n(),
+    mean_theta = mean(theta),
+    sd_theta   = sd(theta),
+    .groups    = "drop"
+  )
+
+# Make distribution plot of theta by true coalition
+theta_eval <- theta_bb_df %>%
+  filter(coalition_true %in% c("baptist", "bootlegger"))
+
+ggplot(theta_eval, aes(x = theta, y = coalition_true, fill = coalition_true)) +
+  geom_violin(trim = FALSE, alpha = 0.3) +
+  geom_boxplot(width = 0.15, outlier.size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Wordfish position (Baptist  ← →  Bootlegger)",
+    y = "",
+    fill = "True coalition"
+  ) +
+  scale_fill_manual(values = wes_palette("BottleRocket2")) +
+  theme_minimal()
+
+```
+
+
+### 5. Statistical tests: can θ detect Bap vs Boot?
+
+```{r}
+# 5.1 t-test
+bb_ttest <- t.test(theta ~ coalition_true, data = theta_eval)
+bb_ttest
+
+# 5.2 Logistic regression: coalition_true ~ θ
+theta_eval <- theta_eval %>%
+  mutate(
+    boot_dummy = if_else(coalition_true == "bootlegger", 1L, 0L)
+  )
+
+glm_bb <- glm(
+  boot_dummy ~ theta,
+  family = binomial(link = "logit"),
+  data   = theta_eval
+)
+
+summary(glm_bb)
+
+# Thresholds implied by the fitted logit (P(boot) = 0.2 / 0.5 / 0.8)
+b0 <- coef(glm_bb)[1]
+b1 <- coef(glm_bb)[2]
+
+theta_mid <- (qlogis(0.5) - b0) / b1
+theta_lo <- (qlogis(0.2) - b0) / b1
+theta_hi <- (qlogis(0.8) - b0) / b1
+
+theta_mid; theta_lo; theta_hi
+
+# 5.3 ROC / AUC: θ as classifier
+roc_bb <- roc(theta_eval$boot_dummy, theta_eval$theta)
+auc(roc_bb)
+
+plot(roc_bb, main = "ROC: Wordfish θ predicting Bootlegger vs Baptist")
+
+
+```
+
+
+### 6. Add unions & others back to see "full map"
+
+```{r}
+# --- Plot 1: with logit-implied thresholds (lo / mid / hi) ---
+theta_bb_df %>%
+  count(coalition_true)
+
+theta_bb_df %>%
+  mutate(
+    coalition_true = forcats::fct_relevel(
+      coalition_true,
+      "baptist", "bootlegger", "hybrid_union", "other"
+    )
+  ) %>%
+  ggplot(aes(x = theta, y = coalition_true, color = coalition_true)) +
+  geom_point(alpha = 0.6, position = position_jitter(height = 0.1, width = 0)) +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  geom_vline(xintercept = theta_lo,  linetype = "dotted") +
+  geom_vline(xintercept = theta_mid, linetype = "dashed") +
+  geom_vline(xintercept = theta_hi,  linetype = "dotted") +
+  labs(
+    x = "Wordfish position (Baptist  \u2190\u2192  Bootlegger)",
+    y = "Coalition label",
+    color = "Coalition"
+  ) +
+  theme_minimal()
+
+# --- Plot 2: full map (simple reference line at 0) ---
+theta_bb_df %>%
+  count(coalition_true)
+
+theta_bb_df %>%
+  mutate(
+    coalition_true = forcats::fct_relevel(
+      coalition_true,
+      "baptist", "bootlegger", "hybrid_union", "other"
+    )
+  ) %>%
+  ggplot(aes(x = theta, y = coalition_true, color = coalition_true)) +
+  geom_point(alpha = 0.6, position = position_jitter(height = 0.1, width = 0)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Wordfish position (Baptist  \u2190\u2192  Bootlegger)",
+    y = "Coalition label",
+    color = "Coalition"
+  ) +
+  theme_minimal()
+
+```
