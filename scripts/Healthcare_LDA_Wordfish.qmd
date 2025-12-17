@@ -1,0 +1,240 @@
+---
+title: "TAD Final project"
+author: "Yuyan He"
+format: html
+editor: visual
+execute:
+  warning: false
+  message: false
+embed-resources: true
+editor_options: 
+  chunk_output_type: console
+---
+
+LDA: using healthcare non-repetitive comments/unique data for topic model
+```{r}
+# load packages
+pacman::p_load(tidyverse, quanteda, quanteda.textstats, quanteda.textmodels, topicmodels, tidytext)
+
+# get data
+data <- read.csv("C:/Users/Whatsername/Desktop/TAD/Final project/data/yy_cms_dbscan_noise_only.csv")
+
+# remove comments with no content, using fullwidth letters, and all words lumped together
+ids_to_remove <- c("CMS-2024-0256-1596", "CMS-2024-0256-4778", "CMS-2024-0256-5529", "CMS-2024-0256-6977", "CMS-2024-0256-6628", "CMS-2024-0256-6739", "CMS-2024-0256-6807", "CMS-2024-0256-6554", "CMS-2024-0256-6356", "CMS-2024-0256-6193", "CMS-2024-0256-4848", "CMS-2024-0256-4780", "CMS-2024-0256-4939", "CMS-2024-0256-4845", "CMS-2024-0256-1687", "CMS-2024-0256-5049", "CMS-2024-0256-5109", "CMS-2024-0256-6726", "CMS-2024-0256-5362", "CMS-2024-0256-5132", "CMS-2024-0256-5160", "CMS-2024-0256-5471", "CMS-2024-0256-5475", "CMS-2024-0256-5469", "CMS-2024-0256-5940", "CMS-2024-0256-6152", "CMS-2024-0256-4930", "CMS-2024-0256-6249", "CMS-2024-0256-4999", "CMS-2024-0256-5664", "CMS-2024-0256-6019", "CMS-2024-0256-6833", "CMS-2024-0256-6892", "CMS-2024-0256-1082", "CMS-2024-0256-5520", "CMS-2024-0256-1729", "CMS-2024-0256-3035", "CMS-2024-0256-4067", "CMS-2024-0256-1582", "CMS-2024-0256-0931", "CMS-2024-0256-5744", "CMS-2024-0256-1479", "CMS-2024-0256-0853", "CMS-2024-0256-5276", "CMS-2024-0256-5768")
+
+data <- data %>%
+  filter(!commentId %in% ids_to_remove)
+
+# pre-processing
+dfm_data <-  corpus(data %>% 
+                    mutate(id=1:nrow(.)),
+                    docid_field="commentId", text_field = "text_clean") %>%
+  tokens(remove_punct = TRUE, remove_numbers = TRUE, remove_symbols=TRUE) %>%
+  dfm() %>%
+  dfm_remove(stopwords("en")) %>%
+  dfm_trim(min_docfreq = 2,
+           verbose = FALSE)
+
+# add text back as variables
+dfm_data$text <- data$text_clean
+
+# keep only the rows with non-zero
+dfm_data <-  dfm_data[rowSums(dfm_data) > 0,]
+
+# set the number of topics
+K <- 30
+
+# estimate
+lda <- LDA(dfm_data, 
+           k = K, 
+           method = "Gibbs",
+           control = list(verbose = 25L, seed = 123,
+                          burnin = 100, iter = 500))
+
+# We can use `get_terms` to the top `n` terms from the topic model, 
+terms <- get_terms(lda, 10)
+
+# terms is a matrix. Easy to convert to a df and clean it a bit
+terms_df <- as_tibble(terms) %>%
+  janitor::clean_names() %>%
+  pivot_longer(cols = contains("topic"), 
+               names_to = "topic", 
+               values_to = "words") %>%
+  group_by(topic) %>%
+  summarise(words= list(words)) %>%
+  mutate(words = map(words, paste, collapse = ", ")) %>%
+  unnest()
+
+# word-topic probabilities ~ beta parameters
+beta_lda <- tidy(lda, matrix="beta")
+beta_lda %>%
+  arrange(topic, desc(beta)) 
+
+# document-topic probabilities ~ gamma parameters
+gamma_lda <- tidy(lda, matrix = "gamma")
+
+# top terms for topics
+beta_lda_top_terms <- beta_lda %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>% 
+  ungroup() %>%
+  arrange(topic, -beta)
+
+beta_lda_top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered()
+
+# get topics for each document
+main_doc_topic <- gamma_lda %>%
+  group_by(topic) %>%
+  slice_max(gamma)
+
+# recreate the dfm
+df <- as_tibble(docvars(dfm_data)) %>%
+       mutate(document=docid(dfm_data)) 
+
+# merge main doc and top terms
+df <- df %>%
+  right_join(main_doc_topic) %>%
+  mutate(topic=paste0("topic_", topic)) %>%
+  left_join(terms_df)
+
+#-----Choose K
+# install.packages("doParallel")
+library(topicmodels)
+library(dplyr)
+library(doParallel)
+
+# Define the range of K values to test
+k_values <- seq(10, 210, 20)
+
+# Set up parallel processing
+num_cores <- detectCores() - 1 
+registerDoParallel(num_cores)
+
+# Fit models and store the log-likelihood
+model_results <- data.frame(K = integer(), log_likelihood = numeric())
+
+for (k in k_values) {
+  # Fit the LDA model
+  lda_model <- LDA(
+    dfm_data, 
+    k = k,
+    method = "Gibbs",
+    control = list(seed = 123, iter = 500)
+  )
+
+# Calculate and store the log-likelihood
+  log_L <- logLik(lda_model)
+  
+  model_results <- model_results |>
+    add_row(K = k, log_likelihood = as.numeric(log_L))
+}
+
+# Stop parallel processing
+stopImplicitCluster()
+
+# Plot the results to find the elbow/peak
+ggplot(model_results, aes(x = K, y = log_likelihood)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "LDA Log-Likelihood vs. Number of Topics (K)")
+
+```
+
+Healthcare repetitive comments: read text and organizational information
+```{r}
+# get data
+data_rep <- read.csv("C:/Users/Whatsername/Desktop/TAD/Final project/data/yy_cms_dbscan_cluster_representatives.csv")
+
+View(data_rep)
+
+```
+
+Healthcare Comments Wordfish Analysis: using unique & repetitive representative comments combined
+```{r}
+library(tidyverse)
+library(tidytext)
+library(quanteda) 
+library(quanteda.textmodels)
+library(wesanderson) 
+
+# use unique comments & repetitive representatives
+fish_data <- read.csv("C:/Users/Whatsername/Desktop/TAD/Final project/Data/yy_cms_dbscan_noise_plus_reps.csv")
+
+corpus_fish <- corpus(fish_data,
+                         text_field = "text_clean",
+                         unique_docnames = TRUE)
+
+# remove comments with no content, using fullwidth letters, and all words lumped together
+corpus_fish <- corpus_fish[!docvars(corpus_fish, "commentId") %in% ids_to_remove]
+
+# tokenization and pre-processing
+toks_fish <- tokens(corpus_fish,
+                       remove_numbers = TRUE, 
+                       remove_punct = TRUE, 
+                       remove_url = TRUE)
+
+toks_fish <- tokens_remove(toks_fish,
+                              c(stopwords(language = "en")),
+                              padding = F)
+
+toks_fish <- tokens_wordstem(toks_fish, language = "en")
+dfm_fish <- dfm(toks_fish)
+dfm_fish <- dfm_trim(dfm_fish, min_docfreq = 2)
+
+#---Get the anchors
+wfish <- textmodel_wordfish(dfm_fish)
+preds <- predict(wfish)
+
+sorted_docs <- sort(preds, decreasing = TRUE)
+head(sorted_docs, 5)
+tail(sorted_docs, 5)
+
+extreme_high_docs <- names(sorted_docs)[1:5]
+extreme_low_docs  <- names(sorted_docs)[(length(sorted_docs)-4):length(sorted_docs)]
+
+as.character(corpus_fish)[extreme_high_docs]
+as.character(corpus_fish)[extreme_low_docs]
+
+wordweights_vec <- wfish$beta
+words <- featnames(dfm_fish)
+names(wordweights_vec) <- words
+top_positive_words <- head(sort(wordweights_vec, decreasing = TRUE), 30)
+top_negative_words <- head(sort(wordweights_vec, decreasing = FALSE), 30)
+
+top_positive_words
+top_negative_words
+
+# Choose text70 as left, and text142 as right
+docnames(dfm_fish)[64]
+docnames(dfm_fish)[132]
+
+# modeling
+# set anchors
+wfish_fish <- textmodel_wordfish(dfm_fish, dir = c(64,132)) 
+summary(wfish_fish)
+
+# Get document scores
+wfish_preds <- predict(wfish_fish, interval = "confidence")
+
+# Tidy everything up:
+posi_fish <- data.frame(docvars(corpus_fish), wfish_preds$fit) %>%
+  arrange(fit)
+
+# Plot
+posi_fish %>%
+  ggplot(aes(x = fit, y = reorder(commentId,fit), xmin = lwr, xmax = upr)) +
+  geom_point(alpha = 0.8) +
+  geom_errorbarh(height = 0) +
+  labs(x = "Position", y = "") +
+  scale_color_manual(values = wes_palette("BottleRocket2")) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  ggtitle("Estimated Positions")
+
+```
