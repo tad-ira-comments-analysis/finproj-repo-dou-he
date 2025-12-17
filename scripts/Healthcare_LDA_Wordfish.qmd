@@ -17,7 +17,7 @@ LDA: using healthcare non-repetitive comments/unique data for topic model
 pacman::p_load(tidyverse, quanteda, quanteda.textstats, quanteda.textmodels, topicmodels, tidytext)
 
 # get data
-data <- read.csv("C:/Users/Whatsername/Desktop/TAD/Final project/data/yy_cms_dbscan_noise_only.csv")
+data <- read.csv("data/dbscan_healthcare_unique.csv")
 
 # remove comments with no content, using fullwidth letters, and all words lumped together
 ids_to_remove <- c("CMS-2024-0256-1596", "CMS-2024-0256-4778", "CMS-2024-0256-5529", "CMS-2024-0256-6977", "CMS-2024-0256-6628", "CMS-2024-0256-6739", "CMS-2024-0256-6807", "CMS-2024-0256-6554", "CMS-2024-0256-6356", "CMS-2024-0256-6193", "CMS-2024-0256-4848", "CMS-2024-0256-4780", "CMS-2024-0256-4939", "CMS-2024-0256-4845", "CMS-2024-0256-1687", "CMS-2024-0256-5049", "CMS-2024-0256-5109", "CMS-2024-0256-6726", "CMS-2024-0256-5362", "CMS-2024-0256-5132", "CMS-2024-0256-5160", "CMS-2024-0256-5471", "CMS-2024-0256-5475", "CMS-2024-0256-5469", "CMS-2024-0256-5940", "CMS-2024-0256-6152", "CMS-2024-0256-4930", "CMS-2024-0256-6249", "CMS-2024-0256-4999", "CMS-2024-0256-5664", "CMS-2024-0256-6019", "CMS-2024-0256-6833", "CMS-2024-0256-6892", "CMS-2024-0256-1082", "CMS-2024-0256-5520", "CMS-2024-0256-1729", "CMS-2024-0256-3035", "CMS-2024-0256-4067", "CMS-2024-0256-1582", "CMS-2024-0256-0931", "CMS-2024-0256-5744", "CMS-2024-0256-1479", "CMS-2024-0256-0853", "CMS-2024-0256-5276", "CMS-2024-0256-5768")
@@ -148,7 +148,7 @@ ggplot(model_results, aes(x = K, y = log_likelihood)) +
 Healthcare repetitive comments: read text and organizational information
 ```{r}
 # get data
-data_rep <- read.csv("C:/Users/Whatsername/Desktop/TAD/Final project/data/yy_cms_dbscan_cluster_representatives.csv")
+data_rep <- read.csv("data/dbscan_healthcare_cluster_representatives.csv")
 
 View(data_rep)
 
@@ -163,7 +163,7 @@ library(quanteda.textmodels)
 library(wesanderson) 
 
 # use unique comments & repetitive representatives
-fish_data <- read.csv("C:/Users/Whatsername/Desktop/TAD/Final project/Data/yy_cms_dbscan_noise_plus_reps.csv")
+fish_data <- read.csv("data/dbscan_healthcare_combined.csv")
 
 corpus_fish <- corpus(fish_data,
                          text_field = "text_clean",
